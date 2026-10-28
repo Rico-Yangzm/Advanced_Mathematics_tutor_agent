@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>考研数学复习 Agent</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/">
+        <span class="brand-mark">∑</span>
+        <span><strong>研数学伴</strong><small>考研数学复习空间</small></span>
+      </a>
+      <div class="side-label">学习模块</div>
+      <nav class="module-nav" aria-label="学习模块">
+        <button class="nav-item active" data-module="tutor"><span class="nav-icon">✳</span>搜题讲解</button>
+        <button class="nav-item" data-module="mastery"><span class="nav-icon">◉</span>掌握分析</button>
+        <button class="nav-item" data-module="roadmap"><span class="nav-icon">⌁</span>路线规划</button>
+        <button class="nav-item" data-module="practice"><span class="nav-icon">▤</span>出题判题</button>
+      </nav>
+      <div class="side-label utility-label">学习资料</div>
+      <nav class="module-nav" aria-label="学习资料">
+        <button class="nav-item utility-item" data-module="library"><span class="nav-icon">▧</span>PDF 资料库</button>
+        <button class="nav-item utility-item" data-module="knowledge"><span class="nav-icon">◷</span>KT 掌握记录</button>
+      </nav>
+      <section class="memory-panel">
+        <div class="memory-heading"><span>共享上下文记忆</span><span class="memory-spark">✦</span></div>
+        <p class="memory-caption">主 Agent 筛选的学习目标与偏好，会在不同模块间共享。</p>
+        <div id="memoryList" class="memory-list"><span class="memory-empty">暂时还没有长期记忆</span></div>
+      </section>
+      <div class="sidebar-footer"><span id="healthDot" class="health-dot"></span><span id="health">正在连接</span></div>
+    </aside>
+
+    <main class="workspace">
+      <header class="workspace-header">
+        <div>
+          <div class="breadcrumbs">考研数学 <span>/</span> <strong id="moduleEyebrow">学习对话</strong></div>
+          <h1 id="moduleTitle">搜题讲解</h1>
+          <p id="moduleDescription">把题目或卡住的步骤发来，我们一次只解决一个关键点。</p>
+        </div>
+        <div class="header-actions">
+          <span class="context-badge"><span></span>对话已保存</span>
+          <button id="clearChatBtn" class="icon-button" title="清空当前模块对话" aria-label="清空当前模块对话">↻</button>
+        </div>
+      </header>
+
+      <section id="chatView" class="chat-view">
+        <div id="chatScroll" class="chat-scroll">
+          <div id="chatMessages" class="chat-messages"></div>
+        </div>
+        <div class="composer-wrap">
+          <div id="topicRow" class="composer-options">
+            <label for="topicInput">知识点 <span>可选</span></label>
+            <input id="topicInput" placeholder="例如：定积分的几何应用">
+            <div id="roadmapOptions" class="roadmap-options" hidden>
+              <label for="examDate">考试日期</label><input id="examDate" type="date">
+              <label for="hours">每周复习</label><div class="hours-input"><input id="hours" type="number" min="1" placeholder="小时"><span>小时</span></div>
+            </div>
+            <label id="answerToggle" class="answer-toggle" hidden><input id="isAnswer" type="checkbox"> 这是我的作答</label>
+          </div>
+          <form id="chatForm" class="composer">
+            <textarea id="messageInput" rows="1" maxlength="12000" placeholder="输入题目、问题或你现在卡住的地方…"></textarea>
+            <div class="composer-bottom">
+              <span id="composerHint">Enter 发送 · Shift + Enter 换行</span>
+              <button id="sendBtn" type="submit"><span>发送</span><span class="send-icon">↑</span></button>
+            </div>
+          </form>
+          <p class="privacy-note">回答由 AI 生成，请结合教材核对；长期记忆可在左侧查看并删除。</p>
+        </div>
+      </section>
+
+      <section id="libraryView" class="tool-view" hidden>
+        <div class="tool-card">
+          <div class="tool-card-heading"><div><span class="tool-icon">▧</span><div><h2>管理复习资料</h2><p>上传可搜索 PDF，讲题时会自动检索相关段落。</p></div></div></div>
+          <form id="uploadForm" class="upload-row">
+            <input id="pdfFile" type="file" accept=".pdf,application/pdf">
+            <button id="uploadBtn" type="submit">上传并建立索引</button>
+          </form>
+          <div id="uploadStatus" class="tool-status" aria-live="polite"></div>
+          <div class="list-heading">已入库资料</div>
+          <ul id="documents" class="document-list"></ul>
+        </div>
+        <div class="tool-note">资料保存在本机 SQLite 数据库中。扫描版 PDF 请先进行 OCR；同名资料再次上传会替换旧版本。</div>
+      </section>
+
+      <section id="knowledgeView" class="tool-view" hidden>
+        <div class="tool-card">
+          <div class="tool-card-heading"><div><span class="tool-icon">◷</span><div><h2>Knowledge Tracing</h2><p>按知识点追踪答题表现，掌握度每累计 4 题更新一次。</p></div></div><button id="refreshKnowledgeBtn" class="light-button">刷新</button></div>
+          <div id="knowledgeList" class="knowledge-list"></div>
+          <button id="analyzeKnowledgeBtn" class="primary-button">在掌握分析中继续对话</button>
+        </div>
+        <div class="tool-note">KT 记录答题表现；左侧“共享上下文记忆”保存的是学习安排、表达偏好等信息，两者分别维护。</div>
+      </section>
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
