@@ -8,6 +8,7 @@ data/
 *.db
 *.sqlite
 *.sqlite3
+/NeurIPS-2025-knowledge-starts-with-practice-knowledge-aware-exercise-generative-recommendation-with-adaptive-multi-agent-cooperation-Paper-Conference.pdf
 
 # Python-generated files
 __pycache__/
@@ -21,6 +22,3 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
-
-# Keep the generated upload changelog local
-更新日志.md

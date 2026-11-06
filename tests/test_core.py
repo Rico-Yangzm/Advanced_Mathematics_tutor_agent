@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,13 +8,15 @@ from app.db import (
     connect,
     get_chat_messages,
     get_knowledge,
+    get_knowledge_observations,
     initialize_database,
     record_attempt,
+    record_knowledge_perception,
     replace_global_memories,
     search_global_memories,
     search_old_chat_messages,
 )
-from app.rag import search_documents, split_text
+from app.rag import ingest_knowledge_pack, search_documents, split_text
 
 
 class CoreTests(unittest.TestCase):
@@ -35,6 +38,87 @@ class CoreTests(unittest.TestCase):
         state = get_knowledge(self.database)[0]
         self.assertAlmostEqual(state["mastery"], 0.60)
         self.assertEqual(state["total_attempts"], 4)
+
+    def test_knowledge_perception_updates_each_concept_from_evidence(self):
+        result = record_knowledge_perception(
+            self.database,
+            "极限",
+            "判断函数极限是否存在并说明理由",
+            False,
+            [
+                {
+                    "concept": "函数极限定义",
+                    "evidence": "not_demonstrated",
+                    "confidence": 0.8,
+                    "rationale": "作答把函数值与极限值混为一谈。",
+                },
+                {
+                    "concept": "连续性",
+                    "evidence": "uncertain",
+                    "confidence": 0.9,
+                    "rationale": "答案没有涉及连续性。",
+                },
+            ],
+        )
+
+        self.assertEqual(result["updated_concepts"], 1)
+        knowledge = {item["topic"]: item for item in get_knowledge(self.database)}
+        state = knowledge["函数极限定义"]
+        self.assertLess(state["mastery"], 0.5)
+        self.assertEqual(state["total_attempts"], 1)
+        self.assertAlmostEqual(state["confidence"], 0.2)
+        self.assertEqual(state["latest_evidence"], "not_demonstrated")
+        self.assertIn("混为一谈", state["latest_rationale"])
+        self.assertEqual(
+            get_knowledge_observations(self.database, ["函数极限定义"])[0]["evidence"],
+            "not_demonstrated",
+        )
+
+    def test_database_initialization_migrates_existing_knowledge_state(self):
+        legacy_database = Path(self.temp_dir.name) / "legacy.sqlite3"
+        connection = sqlite3.connect(legacy_database)
+        try:
+            connection.execute(
+                "CREATE TABLE knowledge_points ("
+                "topic TEXT PRIMARY KEY, mastery REAL NOT NULL DEFAULT 0.5, "
+                "confidence REAL NOT NULL DEFAULT 0, "
+                "total_attempts INTEGER NOT NULL DEFAULT 0, "
+                "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
+            connection.execute(
+                "INSERT INTO knowledge_points(topic, mastery, total_attempts) "
+                "VALUES ('极限', 0.7, 4)"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        initialize_database(legacy_database)
+
+        with connect(legacy_database) as connection:
+            state = connection.execute(
+                "SELECT mastery, total_attempts, evidence_weight "
+                "FROM knowledge_points WHERE topic = '极限'"
+            ).fetchone()
+        self.assertAlmostEqual(state["mastery"], 0.7)
+        self.assertEqual(state["total_attempts"], 4)
+        self.assertEqual(state["evidence_weight"], 4)
+
+    def test_knowledge_pack_import_is_searchable_and_idempotent(self):
+        knowledge_dir = Path(self.temp_dir.name) / "knowledge"
+        subject_dir = knowledge_dir / "高等数学"
+        subject_dir.mkdir(parents=True)
+        (subject_dir / "极限.md").write_text(
+            "函数极限定义描述函数在某点附近的变化趋势。", encoding="utf-8"
+        )
+
+        first = ingest_knowledge_pack(self.database, knowledge_dir)
+        second = ingest_knowledge_pack(self.database, knowledge_dir)
+
+        self.assertEqual(first["documents"], 1)
+        self.assertEqual(second["documents"], 0)
+        results = search_documents(self.database, "函数极限定义")
+        self.assertEqual(results[0]["source"], "11408-math/高等数学/极限.md")
 
     def test_splits_text_and_fts_search_returns_source_chunk(self):
         chunks = split_text("定积分用于计算曲线下面积。微积分基本定理连接导数与积分。")

@@ -32,9 +32,18 @@ def ingest_pdf(
 ) -> dict[str, int | str]:
     reader = PdfReader(BytesIO(content))
     text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    if not split_text(text):
+        raise ValueError("PDF 中未提取到可检索文本；扫描版 PDF 请先进行 OCR。")
+    result = ingest_text(database_path, source, text)
+    return {**result, "pages": len(reader.pages)}
+
+
+def ingest_text(
+    database_path: Path | str, source: str, text: str
+) -> dict[str, int | str]:
     chunks = split_text(text)
     if not chunks:
-        raise ValueError("PDF 中未提取到可检索文本；扫描版 PDF 请先进行 OCR。")
+        raise ValueError("资料中未提取到可检索文本。")
 
     with connect(database_path) as connection:
         existing = connection.execute(
@@ -59,7 +68,31 @@ def ingest_pdf(
                 "VALUES (?, ?, ?, ?)",
                 (source, str(chunk_cursor.lastrowid), chunk, searchable_text(chunk)),
             )
-    return {"source": source, "chunks": len(chunks), "pages": len(reader.pages)}
+    return {"source": source, "chunks": len(chunks)}
+
+
+def ingest_knowledge_pack(
+    database_path: Path | str, directory: Path | str
+) -> dict[str, int]:
+    root = Path(directory)
+    if not root.is_dir():
+        raise FileNotFoundError(f"数学知识库目录不存在：{root}")
+
+    files = sorted(root.glob("*/*.md"))
+    imported = 0
+    chunks = 0
+    for path in files:
+        source = f"11408-math/{path.relative_to(root).as_posix()}"
+        with connect(database_path) as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM documents WHERE source = ?", (source,)
+            ).fetchone()
+        if exists:
+            continue
+        result = ingest_text(database_path, source, path.read_text(encoding="utf-8"))
+        imported += 1
+        chunks += int(result["chunks"])
+    return {"documents": imported, "chunks": chunks}
 
 
 def search_documents(

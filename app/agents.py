@@ -31,10 +31,31 @@ PROMPTS = {
 低掌握度主题优先，置信度低的主题先安排诊断题；路线要可执行、留有复盘和错题回访时间。
 缺少用户信息时明确说明假设，不虚构日期或学习时长。""",
     "quiz_grade": """你是考研数学出题判题 Agent。出题需给出题目、主题、难度、考查点和参考答案（答案需隐藏在
-“参考答案”区块，避免练习时泄露）；题目应与指定知识点同类型但不照搬资料原题。
-判题需比较学生答案与数学上正确的结果，允许等价表达；说明判定依据、关键错因和一个下一步提示。
-只返回合法 JSON 对象，生成题字段为 question, topic, difficulty, concept, answer；
-判题字段为 correct (boolean), feedback, hint。""",
+“参考答案”区块，避免练习时泄露）；题目应针对给定薄弱考点，并结合先修考点设计认知步骤，
+但不能照搬检索资料原题。生成 JSON 字段为 question, topic, difficulty, concept,
+concepts（1-5 个明确考点名称）, answer。
+判题时先分析学生给出的推理/步骤，再判断最终答案；只根据可见证据评价，不从正确答案臆测推理过程。
+按目标考点评价学习证据：demonstrated（有充分证据掌握）、partial（部分掌握）、
+not_demonstrated（错误或关键步骤明确暴露薄弱）、uncertain（信息不足，不更新）。
+给出可解释的简短 rationale 和 0-1 confidence；仅返回合法 JSON：
+correct (boolean), feedback, hint, concept_assessments
+（对象数组，每项包含 concept, evidence, confidence, rationale）。""",
+    "exercise_evaluator": """你是考研数学练习题质量评审员。独立检查候选题与参考答案：
+考点是否对齐指定目标和学习者薄弱点，数学推导/答案是否正确且唯一，条件是否完整、表述是否无歧义，
+难度是否合适，是否只是改写检索资料中的原题。若有可修正问题，指出具体问题并给出可操作的修订要求。
+只有所有关键项达标才 approved=true。只返回合法 JSON：
+{"approved":boolean,"issues":["..."],"revision_instructions":"..."}。""",
+    "dialogue_knowledge": """你是考研数学学习证据整理器。根据本轮学生自己的消息，判断其中是否明确展示了
+可用于知识追踪的数学解题思路、推导步骤或概念解释。之前对话和助教回复只用于理解题目背景，
+绝不能把助教提供的解法、提示或结论当作学生已掌握的证据；提问、复述题目、只说“懂了/不会”、
+请求提示、学习计划和一般寒暄都不是掌握证据。
+仅评估本轮消息中能直接观察到的步骤；按具体知识点分别标注 demonstrated（正确且有充分依据）、
+partial（部分正确或过程不完整）、not_demonstrated（明确出现错误概念/步骤）。
+证据不明确、只给答案而无法判断思路时不要猜测，直接返回空 observations。
+每项 rationale 用不超过 80 字简述对应的用户原话/步骤；confidence 必须反映证据确定性，低于 0.6 的不应输出。
+最多输出 5 个直接相关的考点，不要推断深层先修知识。只返回 JSON：
+{"observations":[{"concept":"具体考点","evidence":"demonstrated|partial|not_demonstrated",
+"confidence":0.0,"rationale":"用户本轮的可见证据"}]}。""",
 }
 
 
@@ -111,34 +132,326 @@ def quiz_or_grade(
     answer: str = "",
     difficulty: str = "中等",
     shared_context: str = "",
+    concepts: list[str] | None = None,
 ) -> dict[str, Any]:
     if mode == "generate":
-        prompt = (
-            f"请生成一道{difficulty}难度的考研数学练习题，主题是“{topic}”。"
-            "题目要检测理解而不是只考机械计算。\n"
-            f"共享的学习偏好与上下文：{shared_context or '无'}"
+        requested_concepts = concepts or []
+        knowledge = db.get_knowledge(DATABASE_PATH)
+        normalized_topic = topic.strip().casefold()
+        target_knowledge = [
+            item
+            for item in knowledge
+            if normalized_topic
+            and (
+                normalized_topic in item["topic"].casefold()
+                or item["topic"].casefold() in normalized_topic
+            )
+        ]
+        relevant_knowledge = target_knowledge or knowledge[:5]
+        targets = requested_concepts or [
+            item["topic"] for item in target_knowledge[:5]
+        ] or [topic]
+        sources = search_documents(
+            DATABASE_PATH, " ".join([topic, *targets]), limit=5
         )
-    else:
-        prompt = (
-            f"主题：{topic}\n题目：{question}\n学生答案：{answer}\n"
-            f"共享的学习偏好与上下文：{shared_context or '无'}\n"
-            "请判定答案，返回指定 JSON 字段。"
+        examples = db.get_knowledge_observations(
+            DATABASE_PATH, targets, limit=6
         )
-    raw = chat(PROMPTS["quiz_grade"], prompt, temperature=0.2)
+        generation_context = "\n\n".join(
+            [
+                f"学习目标：{topic}",
+                f"指定目标考点：{json.dumps(targets, ensure_ascii=False)}",
+                f"难度：{difficulty}",
+                _context_block("相关 KT 状态（低掌握或低置信度优先）", relevant_knowledge),
+                _context_block("相近考点的历史知识感知证据", examples),
+                _context_block("RAG 检索资料，仅用于核验考点与先修关系，不可照抄原题", sources),
+                f"共享的学习偏好与上下文：\n{shared_context or '无'}",
+                "请生成全新题目，明确覆盖目标考点并标注 concepts；题目可检验关键推理步骤。",
+            ]
+        )
+        candidate = None
+        feedback = ""
+        for revision in range(2):
+            prompt = generation_context
+            if feedback:
+                prompt += f"\n\n质量评审的修订要求：\n{feedback}"
+            candidate = _parse_agent_json(
+                chat(PROMPTS["quiz_grade"], prompt, temperature=0.2),
+                "出题 Agent",
+            )
+            _validate_generated_exercise(
+                candidate,
+                targets,
+                require_target=bool(requested_concepts or target_knowledge),
+            )
+            review = _parse_agent_json(
+                chat(
+                    PROMPTS["exercise_evaluator"],
+                    _context_block(
+                        "待评审题目与答案",
+                        {
+                            "exercise": candidate,
+                            "targets": targets,
+                            "sources": sources,
+                            "learner_state": relevant_knowledge,
+                        },
+                    ),
+                    temperature=0.1,
+                ),
+                "质量评审 Agent",
+            )
+            if not isinstance(review.get("approved"), bool):
+                raise ValueError("质量评审 Agent 返回缺少布尔值 approved。")
+            if review["approved"]:
+                return candidate
+            issues = review.get("issues", [])
+            if not isinstance(issues, list) or any(
+                not isinstance(issue, str) for issue in issues
+            ):
+                raise ValueError("质量评审 Agent 返回的 issues 必须是字符串数组。")
+            if revision == 1:
+                raise ValueError(
+                    "练习题经过一次修订后仍未通过质量评审："
+                    + "；".join(str(issue) for issue in issues)
+                )
+            revision_instructions = review.get("revision_instructions", "")
+            if not isinstance(revision_instructions, str):
+                raise ValueError("质量评审 Agent 返回的修订要求必须是字符串。")
+            feedback = revision_instructions.strip()
+            if not feedback:
+                feedback = "请根据评审指出的问题修订题目，并复核答案。"
+        raise ValueError("练习题生成与质量评审未能完成。")
+
+    requested_concepts = list(dict.fromkeys(concepts or [topic]))
+    sources = search_documents(
+        DATABASE_PATH,
+        " ".join([topic, *requested_concepts, question]),
+        limit=5,
+    )
+    knowledge = db.get_knowledge(DATABASE_PATH)
+    relevant_knowledge = [
+        item
+        for item in knowledge
+        if item["topic"] in requested_concepts
+    ]
+    examples = db.get_knowledge_observations(
+        DATABASE_PATH, requested_concepts, limit=6
+    )
+    prompt = "\n\n".join(
+        [
+            f"题目主题：{topic}",
+            f"目标考点（评估时必须使用这些名称）：{json.dumps(requested_concepts, ensure_ascii=False)}",
+            f"题目：{question}\n学生答案及可见解题过程：{answer}",
+            _context_block("目标考点当前掌握状态", relevant_knowledge),
+            _context_block("相同考点的历史感知样例（用于一致性判断）", examples),
+            _context_block("相关知识资料，供核验概念及依赖关系", sources),
+            f"共享的学习偏好与上下文：\n{shared_context or '无'}",
+            "判定正确性；逐个目标考点评价可见解题证据。若只有最终答案而没有步骤，"
+            "不得声称观察到了推理路径；证据不足时用 uncertain，不要更新该考点。",
+        ]
+    )
+    result = _parse_agent_json(
+        chat(PROMPTS["quiz_grade"], prompt, temperature=0.2),
+        "判题与知识感知 Agent",
+    )
+    required = ("correct", "feedback", "hint", "concept_assessments")
+    if any(key not in result for key in required):
+        raise ValueError(f"判题 Agent 返回缺少必需字段：{', '.join(required)}")
+    if not isinstance(result["correct"], bool):
+        raise ValueError("判题结果中的 correct 必须为布尔值。")
+    assessments = _validate_knowledge_assessments(
+        result["concept_assessments"], requested_concepts
+    )
+    result["concept_assessments"] = assessments
+    result["attempt"] = db.record_knowledge_perception(
+        DATABASE_PATH, topic, question, result["correct"], assessments
+    )
+    return result
+
+
+def _parse_agent_json(raw: str, agent_name: str) -> dict[str, Any]:
     try:
         result = json.loads(raw)
     except json.JSONDecodeError as error:
-        raise ValueError(f"出题判题 Agent 未返回合法 JSON：{error}") from error
-    required = ("question", "answer") if mode == "generate" else ("correct", "feedback", "hint")
-    if not isinstance(result, dict) or any(key not in result for key in required):
-        raise ValueError(f"出题判题 Agent 返回缺少必需字段：{', '.join(required)}")
-    if mode == "grade":
-        if not isinstance(result["correct"], bool):
-            raise ValueError("判题结果中的 correct 必须为布尔值。")
-        result["attempt"] = db.record_attempt(
-            DATABASE_PATH, topic, question, result["correct"]
-        )
+        raise ValueError(f"{agent_name}未返回合法 JSON：{error}") from error
+    if not isinstance(result, dict):
+        raise ValueError(f"{agent_name}返回的 JSON 顶层必须是对象。")
     return result
+
+
+def _validate_generated_exercise(
+    result: dict[str, Any], targets: list[str], require_target: bool
+) -> None:
+    required = ("question", "answer", "concepts")
+    if any(key not in result for key in required):
+        raise ValueError(f"出题 Agent 返回缺少必需字段：{', '.join(required)}")
+    concepts = result["concepts"]
+    if (
+        not isinstance(concepts, list)
+        or not concepts
+        or len(concepts) > 5
+        or any(not isinstance(item, str) or not item.strip() for item in concepts)
+    ):
+        raise ValueError("出题 Agent 的 concepts 必须是 1-5 个非空考点名称。")
+    if not isinstance(result["question"], str) or not result["question"].strip():
+        raise ValueError("出题 Agent 返回的题目不能为空。")
+    if not isinstance(result["answer"], str) or not result["answer"].strip():
+        raise ValueError("出题 Agent 返回的参考答案不能为空。")
+    target_names = {item.casefold() for item in targets}
+    if require_target and target_names and not any(
+        concept.casefold() in target_names for concept in concepts
+    ):
+        raise ValueError("出题 Agent 返回的考点未覆盖指定目标。")
+
+
+def _validate_knowledge_assessments(
+    value: Any, requested_concepts: list[str]
+) -> list[dict[str, Any]]:
+    allowed_evidence = {
+        "demonstrated",
+        "partial",
+        "not_demonstrated",
+        "uncertain",
+    }
+    if not isinstance(value, list) or not value or len(value) > 8:
+        raise ValueError("判题 Agent 必须返回 1-8 项知识感知结果。")
+    expected = {item.casefold() for item in requested_concepts}
+    assessments = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("知识感知结果中的考点评估必须是对象。")
+        concept = item.get("concept")
+        evidence = item.get("evidence")
+        confidence = item.get("confidence")
+        rationale = item.get("rationale")
+        if (
+            not isinstance(concept, str)
+            or concept.casefold() not in expected
+            or concept.casefold() in seen
+            or evidence not in allowed_evidence
+            or not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or not 0 <= confidence <= 1
+            or not isinstance(rationale, str)
+            or len(rationale) > 400
+        ):
+            raise ValueError("判题 Agent 返回了无效或不匹配的知识感知结果。")
+        seen.add(concept.casefold())
+        assessments.append(
+            {
+                "concept": concept.strip(),
+                "evidence": evidence,
+                "confidence": float(confidence),
+                "rationale": rationale.strip(),
+            }
+        )
+    return assessments
+
+
+def perceive_dialogue_knowledge(
+    *,
+    module: str,
+    topic: str,
+    user_message: str,
+    history: list[dict[str, str]],
+) -> dict[str, Any]:
+    recent_context = [
+        {
+            "role": item["role"],
+            "content": item["content"][-300:],
+        }
+        for item in history[-2:]
+    ]
+    current_states = db.get_knowledge(DATABASE_PATH)
+    normalized_topic = topic.strip().casefold()
+    relevant_states = [
+        item
+        for item in current_states
+        if normalized_topic
+        and (
+            normalized_topic in item["topic"].casefold()
+            or item["topic"].casefold() in normalized_topic
+        )
+    ][:8]
+    if not relevant_states:
+        relevant_states = current_states[:8]
+    relevant_states = [
+        {
+            "topic": item["topic"],
+            "mastery": item["mastery"],
+            "confidence": item["confidence"],
+        }
+        for item in relevant_states
+    ]
+    evidence_text = user_message
+    if len(evidence_text) > 3000:
+        evidence_text = evidence_text[:1500] + "\n…\n" + evidence_text[-1500:]
+    prompt = "\n\n".join(
+        [
+            f"当前模块：{module}",
+            f"用户填写的知识主题：{topic or '未提供'}",
+            _context_block("当前相关 KT 状态，仅供考点对齐", relevant_states),
+            _context_block("此前对话，仅供理解题目背景，不是本轮学习证据", recent_context),
+            "本轮唯一可用于判断掌握情况的学生消息：\n"
+            + evidence_text,
+        ]
+    )
+    result = _parse_agent_json(
+        chat(PROMPTS["dialogue_knowledge"], prompt, temperature=0.1),
+        "对话知识感知 Agent",
+    )
+    observations = result.get("observations")
+    if not isinstance(observations, list) or len(observations) > 5:
+        raise ValueError("对话知识感知 Agent 返回的 observations 必须是最多 5 项的数组。")
+    allowed_evidence = {"demonstrated", "partial", "not_demonstrated"}
+    assessments = []
+    seen = set()
+    for item in observations:
+        if not isinstance(item, dict):
+            raise ValueError("对话知识感知结果中的考点评估必须是对象。")
+        concept = item.get("concept")
+        evidence = item.get("evidence")
+        confidence = item.get("confidence")
+        rationale = item.get("rationale")
+        if (
+            not isinstance(concept, str)
+            or not concept.strip()
+            or len(concept.strip()) > 120
+            or concept.casefold() in seen
+            or evidence not in allowed_evidence
+            or not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or not 0.6 <= confidence <= 1
+            or not isinstance(rationale, str)
+            or not rationale.strip()
+            or len(rationale) > 160
+        ):
+            raise ValueError("对话知识感知 Agent 返回了无效的学习证据。")
+        seen.add(concept.casefold())
+        assessments.append(
+            {
+                "concept": concept.strip(),
+                "evidence": evidence,
+                "confidence": float(confidence),
+                "rationale": rationale.strip(),
+            }
+        )
+    if not assessments:
+        return {"updated_concepts": [], "knowledge": []}
+
+    record_topic = topic.strip() or assessments[0]["concept"]
+    recorded = db.record_knowledge_perception(
+        DATABASE_PATH,
+        record_topic,
+        evidence_text,
+        all(item["evidence"] == "demonstrated" for item in assessments),
+        assessments,
+    )
+    return {
+        "updated_concepts": [item["concept"] for item in assessments],
+        "knowledge": recorded["knowledge"],
+    }
 
 
 def run_main_agent(

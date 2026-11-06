@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>考研数学复习 Agent</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=formula-input-1">
 </head>
 <body>
   <div class="app-shell">
@@ -62,8 +62,15 @@
           </div>
           <form id="chatForm" class="composer">
             <textarea id="messageInput" rows="1" maxlength="12000" placeholder="输入题目、问题或你现在卡住的地方…"></textarea>
+            <section id="formulaToolbar" class="formula-toolbar" aria-label="数学公式快捷输入" hidden>
+              <div id="formulaButtons" class="formula-button-groups"></div>
+              <p class="formula-hint">点击插入 LaTeX；带空白占位符的公式会自动定位光标。可先选中文字，再点分式等结构公式进行包裹。</p>
+            </section>
             <div class="composer-bottom">
-              <span id="composerHint">Enter 发送 · Shift + Enter 换行</span>
+              <div class="composer-tools">
+                <button id="formulaToggle" class="formula-toggle" type="button" aria-expanded="false" aria-controls="formulaToolbar">∑ 公式</button>
+                <span id="composerHint">Enter 发送 · Shift + Enter 换行</span>
+              </div>
               <button id="sendBtn" type="submit"><span>发送</span><span class="send-icon">↑</span></button>
             </div>
           </form>
@@ -87,7 +94,7 @@
 
       <section id="knowledgeView" class="tool-view" hidden>
         <div class="tool-card">
-          <div class="tool-card-heading"><div><span class="tool-icon">◷</span><div><h2>Knowledge Tracing</h2><p>按知识点追踪答题表现，掌握度每累计 4 题更新一次。</p></div></div><button id="refreshKnowledgeBtn" class="light-button">刷新</button></div>
+          <div class="tool-card-heading"><div><span class="tool-icon">◷</span><div><h2>Knowledge Tracing</h2><p>依据用户明确表达的解题步骤即时更新考点状态；证据不足时不更新。</p></div></div><button id="refreshKnowledgeBtn" class="light-button">刷新</button></div>
           <div id="knowledgeList" class="knowledge-list"></div>
           <button id="analyzeKnowledgeBtn" class="primary-button">在掌握分析中继续对话</button>
         </div>
@@ -95,6 +102,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/app.js"></script>
+  <script defer src="/static/app.js?v=formula-input-1"></script>
 </body>
 </html>

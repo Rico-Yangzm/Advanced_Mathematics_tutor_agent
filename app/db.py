@@ -46,6 +46,7 @@ def initialize_database(database_path: Path | str) -> None:
                 mastery REAL NOT NULL DEFAULT 0.5,
                 confidence REAL NOT NULL DEFAULT 0.0,
                 total_attempts INTEGER NOT NULL DEFAULT 0,
+                evidence_weight REAL NOT NULL DEFAULT 0.0,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS attempts (
@@ -58,6 +59,19 @@ def initialize_database(database_path: Path | str) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_attempts_topic_pending
                 ON attempts(topic, applied, id);
+            CREATE TABLE IF NOT EXISTS knowledge_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL,
+                question TEXT NOT NULL,
+                correct INTEGER NOT NULL,
+                evidence TEXT NOT NULL,
+                score REAL NOT NULL,
+                confidence REAL NOT NULL,
+                rationale TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_knowledge_observations_topic
+                ON knowledge_observations(topic, id);
             CREATE TABLE IF NOT EXISTS chat_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -99,6 +113,18 @@ def initialize_database(database_path: Path | str) -> None:
                 session_id UNINDEXED, memory_id UNINDEXED, searchable
             );
             """
+        )
+        knowledge_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(knowledge_points)").fetchall()
+        }
+        if "evidence_weight" not in knowledge_columns:
+            connection.execute(
+                "ALTER TABLE knowledge_points ADD COLUMN evidence_weight REAL NOT NULL DEFAULT 0.0"
+            )
+        connection.execute(
+            "UPDATE knowledge_points SET evidence_weight = total_attempts "
+            "WHERE evidence_weight = 0 AND total_attempts > 0"
         )
         columns = {
             row["name"]
@@ -175,17 +201,20 @@ def record_attempt(
         while len(pending) >= 4:
             batch = pending[:4]
             row = connection.execute(
-                "SELECT mastery, total_attempts FROM knowledge_points WHERE topic = ?",
+                "SELECT mastery, total_attempts, evidence_weight "
+                "FROM knowledge_points WHERE topic = ?",
                 (topic,),
             ).fetchone()
             accuracy = sum(item["correct"] for item in batch) / 4
             mastery = 0.6 * row["mastery"] + 0.4 * accuracy
             total_attempts = row["total_attempts"] + 4
+            evidence_weight = row["evidence_weight"] + 4
             confidence = min(1.0, total_attempts / 12)
             connection.execute(
                 "UPDATE knowledge_points SET mastery = ?, confidence = ?, "
-                "total_attempts = ?, updated_at = CURRENT_TIMESTAMP WHERE topic = ?",
-                (mastery, confidence, total_attempts, topic),
+                "total_attempts = ?, evidence_weight = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE topic = ?",
+                (mastery, confidence, total_attempts, evidence_weight, topic),
             )
             connection.executemany(
                 "UPDATE attempts SET applied = 1 WHERE id = ?",
@@ -205,13 +234,140 @@ def record_attempt(
     }
 
 
+def record_knowledge_perception(
+    database_path: Path | str,
+    topic: str,
+    question: str,
+    correct: bool,
+    assessments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    score_by_evidence = {
+        "demonstrated": 1.0,
+        "partial": 0.5,
+        "not_demonstrated": 0.0,
+    }
+    valid_assessments = []
+    for assessment in assessments:
+        concept = assessment.get("concept")
+        evidence = assessment.get("evidence")
+        confidence = assessment.get("confidence")
+        rationale = assessment.get("rationale")
+        if (
+            not isinstance(concept, str)
+            or not concept.strip()
+            or evidence not in {*score_by_evidence, "uncertain"}
+            or not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or not 0 <= confidence <= 1
+            or not isinstance(rationale, str)
+            or len(rationale) > 400
+        ):
+            raise ValueError("知识感知结果中包含无效的考点证据。")
+        if evidence != "uncertain" and confidence > 0:
+            valid_assessments.append(
+                (
+                    concept.strip(),
+                    evidence,
+                    score_by_evidence[evidence],
+                    float(confidence),
+                    rationale.strip(),
+                )
+            )
+
+    with connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO attempts(topic, question, correct, applied) "
+            "VALUES (?, ?, ?, 1)",
+            (topic, question, int(correct)),
+        )
+        updated_topics = []
+        for concept, evidence, score, confidence, rationale in valid_assessments:
+            connection.execute(
+                "INSERT OR IGNORE INTO knowledge_points(topic) VALUES (?)",
+                (concept,),
+            )
+            state = connection.execute(
+                "SELECT mastery, confidence, total_attempts, evidence_weight "
+                "FROM knowledge_points WHERE topic = ?",
+                (concept,),
+            ).fetchone()
+            total_attempts = state["total_attempts"] + 1
+            evidence_weight = state["evidence_weight"] + confidence
+            learning_rate = 0.35 * confidence
+            mastery = state["mastery"] + learning_rate * (score - state["mastery"])
+            state_confidence = min(1.0, total_attempts / 4) * (
+                evidence_weight / total_attempts
+            )
+            connection.execute(
+                "UPDATE knowledge_points SET mastery = ?, confidence = ?, "
+                "total_attempts = ?, evidence_weight = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE topic = ?",
+                (
+                    mastery,
+                    state_confidence,
+                    total_attempts,
+                    evidence_weight,
+                    concept,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO knowledge_observations"
+                "(topic, question, correct, evidence, score, confidence, rationale) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    concept,
+                    question,
+                    int(correct),
+                    evidence,
+                    score,
+                    confidence,
+                    rationale,
+                ),
+            )
+            updated_topics.append(concept)
+        states = []
+        for concept in updated_topics:
+            row = connection.execute(
+                "SELECT topic, mastery, confidence, total_attempts, updated_at "
+                "FROM knowledge_points WHERE topic = ?",
+                (concept,),
+            ).fetchone()
+            states.append(dict(row))
+
+    return {
+        "knowledge": states,
+        "updated_concepts": len(updated_topics),
+        "evidence_count": len(valid_assessments),
+    }
+
+
+def get_knowledge_observations(
+    database_path: Path | str, topics: list[str], limit: int = 6
+) -> list[dict[str, Any]]:
+    if not topics:
+        return []
+    placeholders = ", ".join("?" for _ in topics)
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            "SELECT topic, question, correct, evidence, rationale, created_at "
+            "FROM knowledge_observations "
+            f"WHERE topic IN ({placeholders}) ORDER BY id DESC LIMIT ?",
+            (*topics, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_knowledge(database_path: Path | str) -> list[dict[str, Any]]:
     with connect(database_path) as connection:
         rows = connection.execute(
             """
             SELECT k.topic, k.mastery, k.confidence, k.total_attempts, k.updated_at,
                    (SELECT COUNT(*) FROM attempts a
-                    WHERE a.topic = k.topic AND a.applied = 0) AS pending_attempts
+                    WHERE a.topic = k.topic AND a.applied = 0) AS pending_attempts,
+                   (SELECT o.evidence FROM knowledge_observations o
+                    WHERE o.topic = k.topic ORDER BY o.id DESC LIMIT 1) AS latest_evidence,
+                   (SELECT o.rationale FROM knowledge_observations o
+                    WHERE o.topic = k.topic ORDER BY o.id DESC LIMIT 1) AS latest_rationale
             FROM knowledge_points k ORDER BY k.mastery ASC, k.topic ASC
             """
         ).fetchall()

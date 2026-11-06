@@ -112,14 +112,30 @@ def _format_practice_result(
             active_question["question"],
             message,
             shared_context=result["context"],
+            concepts=active_question.get("concepts", []),
         )
         state.pop("active_question", None)
         db.set_module_state(DATABASE_PATH, session_id, module, state)
-        attempt = graded["attempt"]
+        evidence_labels = {
+            "demonstrated": "有掌握证据",
+            "partial": "部分掌握",
+            "not_demonstrated": "仍需加强",
+            "uncertain": "证据不足，暂不更新",
+        }
+        evidence_lines = [
+            f"- {item['concept']}：{evidence_labels[item['evidence']]} "
+            f"（置信度 {item['confidence']:.0%}）— {item['rationale']}"
+            for item in graded["concept_assessments"]
+        ]
+        evidence_summary = (
+            "\n".join(evidence_lines)
+            if evidence_lines
+            else "本次没有足够证据更新目标考点。"
+        )
         response = (
             f"**{'回答正确' if graded['correct'] else '还需要再想一步'}**\n\n"
             f"{graded['feedback']}\n\n**下一步提示：** {graded['hint']}\n\n"
-            f"本知识点待更新题数：{attempt['pending_attempts']}（每 4 题更新 KT）"
+            f"**知识感知更新：**\n{evidence_summary}"
         )
         return response, {"grading": graded}
 
@@ -148,6 +164,7 @@ def _format_practice_result(
         f"**{generated['question']}**\n\n"
         f"考查点：{generated.get('concept', topic)} · "
         f"难度：{generated.get('difficulty', '中等')}\n\n"
+        f"目标考点：{'、'.join(generated.get('concepts', []))}\n\n"
         "想要提示可以直接问我；准备好后，勾选输入框旁的“提交作答”再发送答案。"
     )
     return response, {"practice_pending": True}
@@ -303,6 +320,28 @@ def send_message(
         intent,
         session_id,
     )
+    knowledge_update = None
+    knowledge_update_error = None
+    if module in {"tutor", "mastery", "practice"} and "grading" not in metadata:
+        try:
+            knowledge_update = agents.perceive_dialogue_knowledge(
+                module=module,
+                topic=topic,
+                user_message=message,
+                history=db.get_recent_chat_messages(
+                    DATABASE_PATH, session_id, module, RECENT_MESSAGE_LIMIT
+                ),
+            )
+            updated_concepts = knowledge_update["updated_concepts"]
+            if updated_concepts:
+                response += (
+                    "\n\n**KT 证据记录：**本轮解题过程更新了 "
+                    + "、".join(updated_concepts)
+                    + "。"
+                )
+        except (LLMConfigurationError, LLMRequestError, ValueError) as error:
+            knowledge_update_error = str(error)
+            logger.warning("Dialogue knowledge state was not updated: %s", error)
     if metadata.get("sources"):
         response += "\n\n参考资料：" + "、".join(
             source for source in (item.get("source", "") for item in metadata["sources"])
@@ -333,6 +372,8 @@ def send_message(
         "module": module,
         "message": response,
         "metadata": metadata,
+        "knowledge_update": knowledge_update,
+        "knowledge_update_error": knowledge_update_error,
         "memory_updated": memory_updated,
         "memory_error": memory_error,
         "summary_updated": summary_updated,

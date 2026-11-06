@@ -10,9 +10,9 @@ from pypdf.errors import PdfReadError
 from app import db
 from app import agents
 from app import chat
-from app.config import DATABASE_PATH, KT_BATCH_SIZE, ROOT_DIR
+from app.config import DATABASE_PATH, KT_BATCH_SIZE, MATH_KNOWLEDGE_DIR, ROOT_DIR
 from app.llm import LLMConfigurationError, LLMRequestError
-from app.rag import ingest_pdf, search_documents
+from app.rag import ingest_knowledge_pack, ingest_pdf, search_documents
 
 
 app = FastAPI(
@@ -21,6 +21,7 @@ app = FastAPI(
     version="0.1.0",
 )
 db.initialize_database(DATABASE_PATH)
+ingest_knowledge_pack(DATABASE_PATH, MATH_KNOWLEDGE_DIR)
 
 
 class MainRequest(BaseModel):
@@ -54,6 +55,7 @@ class QuizRequest(BaseModel):
     question: str = ""
     answer: str = ""
     difficulty: Literal["基础", "中等", "提高"] = "中等"
+    concepts: list[str] = Field(default_factory=list, max_length=8)
 
 
 class RagSearchRequest(BaseModel):
@@ -137,6 +139,7 @@ def quiz_grade_agent(request: QuizRequest):
             request.question,
             request.answer,
             request.difficulty,
+            concepts=request.concepts,
         )
         if request.mode == "generate":
             result.pop("answer", None)
